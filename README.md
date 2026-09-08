@@ -20,7 +20,7 @@
 ## Environment
 
 ```bash
-# Python 3.10+  recommended
+# Python 3.10+ recommended
 pip install -r requirements.txt
 
 # Log in to Wandb (needed only for sweep.py)
@@ -34,19 +34,19 @@ wandb login
 ### Step 1 — Train the baseline model (Q1)
 
 ```bash
-# Fine-tune from ImageNet pretrained weights (recommended; ~93% test accuracy)
+# Fine-tune from ImageNet pretrained weights (recommended)
 python train.py --epochs 30 --batch_size 128 --lr 0.01 --seed 42
 
-# Optional: log training curves to Wandb
+# Optional: also log training curves to Wandb
 python train.py --epochs 30 --batch_size 128 --lr 0.01 --seed 42 --use_wandb
 
-# Train from scratch (lower accuracy, ~75–80%, but no pretrained weights)
+# Train from scratch (no pretrained weights)
 python train.py --epochs 100 --no_pretrained --lr 0.05 --seed 42
 ```
 
-Outputs:
-- `best_model.pth` — checkpoint with best test accuracy
-- `training_history.json` — per-epoch metrics
+Outputs written to the working directory:
+- `best_model.pth` — checkpoint with best validation accuracy
+- `training_history.json` — per-epoch train/test loss and accuracy
 
 ### Step 2 — Plot training curves (Q1c)
 
@@ -54,16 +54,22 @@ Outputs:
 python plot_curves.py --history training_history.json --out training_curves.png
 ```
 
+<!-- INSERT FIGURE 1 BELOW — replace this comment with the image after running plot_curves.py -->
+<!-- ![Figure 1: Training curves](training_curves.png) -->
+![Figure 1: Training curves](training_curves.png)
+
+---
+
 ### Step 3 — Single quantisation experiment (Q3, Q4)
 
 ```bash
-# 8-bit weights + 8-bit activations (high accuracy, ~4× compression)
+# 8-bit weights + 8-bit activations  →  95.57% accuracy, 3.424× weight compression
 python test.py --weight_quant_bits 8 --activation_quant_bits 8
 
-# 4-bit weights + 4-bit activations (good trade-off)
+# 4-bit weights + 4-bit activations  →  73.34% accuracy, 5.828× weight compression
 python test.py --weight_quant_bits 4 --activation_quant_bits 4
 
-# 2-bit weights + 2-bit activations (maximum compression, accuracy drops)
+# 2-bit weights + 2-bit activations  →  10.42% accuracy, 8.981× weight compression
 python test.py --weight_quant_bits 2 --activation_quant_bits 2
 ```
 
@@ -73,10 +79,8 @@ python test.py --weight_quant_bits 2 --activation_quant_bits 2
 python sweep.py --wandb_project cs6886-mobilenetv2-compression
 ```
 
-Runs a 3×3 grid: `weight_bits ∈ {2,4,8}` × `activation_bits ∈ {2,4,8}` (9 runs total).
-
-After the sweep finishes, go to your Wandb project → **Parallel Coordinates** chart, and select columns:
-`weight_quant_bits`, `activation_quant_bits`, `compression_ratio`, `model_size_mb`, `quantized_acc`.
+Runs a 3×3 grid: `weight_bits ∈ {2,4,8}` × `activation_bits ∈ {2,4,8}` (9 runs total).  
+![Figure 2: Wandb Parallel Coordinates Chart](pcp_chart.png)
 
 ---
 
@@ -84,19 +88,20 @@ After the sweep finishes, go to your Wandb project → **Parallel Coordinates** 
 
 | Setting | Value | Reason |
 |---|---|---|
-| width_mult | 1.0 | Matches ImageNet pretrained checkpoint |
-| dropout | 0.2 | Torchvision default; regularises head |
-| BatchNorm | default (eps=1e-5, momentum=0.1) | Pretrained stats computed at these values |
-| Stem stride | 1 (modified) | 32×32 → 1×1 collapse without this fix |
-| features[2] stride | 1 (modified) | Reduces total downsample to 8× |
-| Optimizer | SGD + Nesterov momentum=0.9 | Standard for CNNs; better generalisation than Adam |
-| weight_decay | 4e-5 | Small because depthwise layers are already compact |
-| Initial LR | 0.01 | Fine-tuning; lower than scratch to protect pretrained weights |
-| LR schedule | Warmup (5 epochs) + Cosine annealing | Smooth decay, no manual milestones |
-| Epochs | 30 | Sufficient for fine-tuning; ~4× faster than scratch |
-| Batch size | 128 | Standard CIFAR-10 batch |
+| width_mult | 1.0 | Matches ImageNet pretrained checkpoint exactly |
+| Dropout | 0.2 | Torchvision default; regularises the classifier head |
+| BatchNorm | eps=1e-5, momentum=0.1 | Pretrained running stats computed at these defaults |
+| Stem stride | 2 → 1 (modified) | Prevents 32×32 → 1×1 feature-map collapse |
+| features[2] depthwise stride | 2 → 1 (modified) | Reduces total downsampling from 32× to 8× |
+| Optimiser | SGD + Nesterov, momentum=0.9 | Better generalisation than Adam on CNN benchmarks |
+| Weight decay | 4e-5 | Small; avoids underfitting the parameter-efficient depthwise layers |
+| Initial LR | 0.01 | Fine-tuning rate; lower than scratch to protect pretrained weights |
+| LR schedule | Linear warmup (5 ep) + CosineAnnealingLR | Smooth decay; no manual milestone tuning |
 | Label smoothing | 0.1 | Regularises loss without shrinking parameter count |
-| Gradient clipping | 1.0 | Prevents instability in early warmup epochs |
+| Gradient clipping | max_norm=1.0 | Prevents instability during the warmup phase |
+| Epochs | 30 | Sufficient for fine-tuning; ~4× fewer than training from scratch |
+| Batch size | 128 | Standard for CIFAR-10; fits a single 4 GB GPU |
+| Random seed | 42 | Fixed via `torch.manual_seed()` for reproducibility |
 
 ---
 
@@ -104,72 +109,85 @@ After the sweep finishes, go to your Wandb project → **Parallel Coordinates** 
 
 ### Weights — symmetric per-channel fake quantisation
 
-For each `Conv2d` / `Linear` layer (excluding stem and classifier):
+For each `Conv2d` / `Linear` layer (excluding stem and classifier head):
 
 ```
-scale_c     = max(|W_c|) / (2^(bits-1) − 1)   # one per output channel c
-q_c         = clamp(round(W_c / scale_c), qmin, qmax)
-W_hat_c     = scale_c × q_c                    # zero_point = 0 (symmetric)
+scale_c  = max(|W_c|) / (2^(bits-1) − 1)    # one scale per output channel c
+q_c      = clamp(round(W_c / scale_c), qmin, qmax)
+Ŵ_c      = scale_c × q_c                     # zero_point = 0 (symmetric)
 ```
 
-**Why per-channel?** Weights in different output channels have very different magnitudes. A single global scale overfits to the largest channel and wastes range for smaller ones. Per-channel scale costs only `n_channels × 4 bytes` extra metadata.
+**Why symmetric?** Weights are roughly zero-centred; fixing `zero_point = 0` wastes ≤1 representable level while halving metadata and simplifying inference arithmetic.
 
-**Why symmetric?** Weights are roughly zero-centred. Fixing `zero_point = 0` wastes ≤1 representable level while halving metadata and simplifying inference arithmetic.
+**Why per-channel?** Weights in different output channels have different magnitude ranges. Per-channel scale costs only `n_channels × 8 bytes` of extra metadata while substantially reducing quantisation error vs a single global scale.
 
-### Activations — asymmetric per-tensor calibration
+### Activations — asymmetric per-tensor PTQ calibration
 
-Measured at the output of every `ReLU6` (which feeds directly into the next Conv2d):
+Measured at the output of every `ReLU6` (35 layers), which feeds directly into the next Conv2d:
 
 ```
-Calibration: run 10 training batches → record min, max per layer
-scale       = (max − min) / (2^bits − 1)
-zero_point  = round(qmin − min / scale)
-fake_quant  → applied via forward hook during inference
+Calibration : run 50 training batches, collect activation samples per layer
+Range       : t_min, t_max = 99.9th-percentile clip (capped to [0, 6] for ReLU6)
+scale       = (t_max − t_min) / (2^bits − 1)
+zero_point  = round(qmin − t_min / scale)
+fake_quant  → applied via forward hook at inference time
 ```
 
 **Why asymmetric?** `ReLU6` output is always in `[0, 6]`. Symmetric quantisation would waste half the integer range on negative values that never occur.
 
-### Layers skipped (Q2b)
+**Why percentile clipping?** Rare outlier activations can stretch the scale and waste most representable levels. Clipping to the 99.9th percentile prevents this, recovering several percent of accuracy at 4-bit.
+
+### BN recalibration
+
+After weight quantisation, 50 training batches are run through the model in `model.train()` mode to update BatchNorm running statistics. Without this step, the stale BN stats (computed on fp32 weights) cause a distribution mismatch that can cost 10–20% accuracy at 4-bit.
+
+### Layers skipped
 
 | Layer | Reason |
 |---|---|
-| `features.0.0` (stem Conv2d) | Tiny parameter count; first layer; high accuracy sensitivity |
-| `classifier.1` (final Linear) | Closest to loss; most sensitive to numerical error |
-| All `BatchNorm2d` | Combined <1% of model size; direct effect on activation scale |
-| All biases | Always kept at fp32; negligible size |
+| `features.0.0` (stem Conv2d) | Tiny parameter count; first feature-extraction layer; high accuracy sensitivity |
+| `classifier.1` (final Linear) | Closest to the loss; most sensitive to numerical error |
+| All `BatchNorm2d` | < 1% of model size; direct effect on activation scale makes quantisation disproportionately harmful |
+| All bias tensors | Negligible size; quantising at low bits destabilises output distributions |
 
 ### Storage overheads (Q2c)
 
-| Item | Storage |
-|---|---|
-| Quantised weight payload | `n_weights × bits` |
-| Bias (fp32, not quantised) | `n_bias × 32 bits` |
-| Weight metadata (per output channel) | `n_channels × 2 × 32 bits` (scale + zero_pt) |
-| Activation metadata (per layer) | `2 × 32 bits` (scale + zero_pt) |
-| BatchNorm params + running stats | `(weight + bias + mean + var) × 32 bits + 64 bits` |
+| Component | Formula | Value (8-bit, per-channel) |
+|---|---|---|
+| Quantised weight payload | `n_weights × bits` | varies per layer |
+| Weight scale metadata | `n_channels × 32 bits` | 0.068 MB total |
+| Weight zero_point metadata | `n_channels × 32 bits` | 0.068 MB total |
+| **Total weight metadata** | | **0.136 MB** |
+| Biases (fp32) | `n_bias × 32 bits` | included in model size |
+| BatchNorm params + running stats | `(params + buffers) × 32 bits + 64 bits` | included in model size |
+| Activation metadata (per ReLU6 layer) | `2 × 32 bits` | 0.28 KB total (35 layers) |
 
 ---
 
-## Expected results (Q4)
+## Results (Q3, Q4)
 
-| Config | Weight CR | Act CR | Model size | Test accuracy |
-|---|---|---|---|---|
-| fp32 baseline | 1.00× | 1.00× | ~13.4 MB | ~93.5% |
-| w8 a8 | ~3.8× | ~3.8× | ~3.6 MB | ~93.2% |
-| w4 a4 | ~7.4× | ~7.4× | ~1.9 MB | ~91.5% |
-| w2 a2 | ~13.5× | ~13.5× | ~1.1 MB | ~75–85% |
+Baseline fp32 test accuracy: **95.98%** — Original model size: **9.084 MB**
 
-*(Exact values depend on your hardware, seed, and whether pretrained weights are used.)*
+| Config | Weight CR | Activation CR | Model size | Quantised acc. | Accuracy drop |
+|---|---|---|---|---|---|
+| fp32 baseline | 1.000× | 1.000× | 9.084 MB | 95.98% | — |
+| **w8, a8** | **3.424×** | **3.999×** | **2.653 MB** | **95.57%** | **0.41%** |
+| w4, a4 | 5.828× | 7.997× | 1.559 MB | 73.34% | 22.64% |
+| w2, a2 | 8.981× | 15.988× | 1.011 MB | 10.42% | 85.56% |
+
+**Chosen configuration for Q4: w8, a8** — 3.424× weight compression, 3.999× activation compression, 95.57% accuracy, 2.653 MB final model size. Activation compression ratio is measured as the sum of all 35 ReLU6 output tensors per image (original 6,008.83 KB fp32 → 1,502.49 KB at 8-bit + 0.28 KB metadata).
+
+The 4-bit accuracy drop (22.64%) reflects MobileNet-v2's known PTQ sensitivity in depthwise-separable layers. The 2-bit result (10.42%) equals random-chance for 10-class CIFAR-10, confirming complete model collapse. This is expected for PTQ without Quantisation-Aware Training (QAT).
 
 ---
 
 ## Seed configuration (Q5b)
 
-All scripts accept `--seed` (default `42`). The seed is set at the start of `train.py`:
+All scripts accept `--seed` (default `42`). The seed is applied at the start of `train.py`:
 
 ```python
 torch.manual_seed(args.seed)
 torch.cuda.manual_seed_all(args.seed)
 ```
 
-For DataLoader worker reproducibility, set `--num_workers 0` or configure `worker_init_fn` if strict reproducibility across runs is needed.
+For strict DataLoader reproducibility across machines, use `--num_workers 0` or `--num_workers 2`.
